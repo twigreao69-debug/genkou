@@ -98,11 +98,20 @@ function rowOf(i){return i%ROWS;}
 
 // PDF座標定数 (points)
 const PDF_W=842.16, PDF_H=595.20;
-const px2pt=72/150;
-const OL=132*px2pt, OR_=1548*px2pt, OT=111*px2pt, OB=1107*px2pt;
-const META_R=1673*px2pt;
-const CW=(OR_-OL)/COLS, CH=(OB-OT)/ROWS;
-const META_SPLIT_PDF_Y = PDF_H - 660*px2pt; // PDF座標(下基点)での区切りy
+// グリッド座標 (pt) - 中央に余白あり・左右2ブロック構造
+const OL=63.36, OR_=743.04, OT=53.28, OB=531.36;
+const LBR=391.68;   // 左ブロック右端 (col9/col10の境界左線の左エッジ)
+const RBL=415.80;   // 右ブロック左端 (col9/col10の境界右線の右エッジ)
+const CL=32.832;    // 左ブロック列幅
+const CR=32.724;    // 右ブロック列幅
+const CH=23.904;    // 行高
+const META_R=803.04; // メタ欄右端
+// 列中心x座標を返す関数 (col=0=右端)
+function colCx(col){
+  return col < 10
+    ? OR_ - (col+0.5)*CR      // 右ブロック (col 0-9)
+    : LBR - (col-10+0.5)*CL;  // 左ブロック (col 10-19)
+}
 
 /* ── レンダリング ────────────────────────── */
 function render(){
@@ -235,14 +244,22 @@ const ime=document.getElementById('ime');
 function focusIME(){ime.value='';ime.focus();}
 
 ime.addEventListener('keydown',e=>{
-  if(e.isComposing)return;
-  if(e.key==='Backspace'){e.preventDefault();deleteChar();return;}
-  if(e.key==='ArrowDown'){e.preventDefault();moveDelta(+1,0);return;}
-  if(e.key==='ArrowUp'){e.preventDefault();moveDelta(-1,0);return;}
-  if(e.key==='ArrowLeft'){e.preventDefault();moveDelta(0,+1);return;}
-  if(e.key==='ArrowRight'){e.preventDefault();moveDelta(0,-1);return;}
-  if(e.key==='Enter'){e.preventDefault();insertChar('\u3000');return;}
-  if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){e.preventDefault();insertChar(e.key);}
+  if(e.isComposing) return;
+  switch(e.key){
+    case 'Backspace':  e.preventDefault(); deleteChar(); return;
+    case 'Delete':     e.preventDefault(); deleteForward(); return;
+    case 'Enter':      e.preventDefault(); insertChar('\u3000'); return; // 全角スペースで字下げ
+    case 'ArrowDown':  e.preventDefault(); moveDelta(+1, 0); return;
+    case 'ArrowUp':    e.preventDefault(); moveDelta(-1, 0); return;
+    case 'ArrowLeft':  e.preventDefault(); moveDelta(0, +1); return;  // 縦書き: 左=次の列
+    case 'ArrowRight': e.preventDefault(); moveDelta(0, -1); return;  // 縦書き: 右=前の列
+    case 'Home':       e.preventDefault(); cur.idx=colOf(cur.idx)*ROWS; render(); focusIME(); return;
+    case 'End':        e.preventDefault(); cur.idx=colOf(cur.idx)*ROWS+ROWS-1; render(); focusIME(); return;
+    case 'Tab':        e.preventDefault(); insertChar('\u3000'); return;
+  }
+  if(e.key.length===1 && !e.ctrlKey && !e.metaKey && !e.altKey){
+    e.preventDefault(); insertChar(e.key);
+  }
 });
 ime.addEventListener('compositionend',e=>{
   const txt=e.data||'';ime.value='';
@@ -303,6 +320,16 @@ function deleteChar(){
   while(pages.length>1&&pages[pages.length-1].every(c=>!c))pages.pop();
   cur={page:p,idx};render();focusIME();
 }
+function deleteForward(){
+  // カーソル位置の文字を削除してカーソルは動かない
+  const p=cur.page,idx=cur.idx;
+  const arr=pages[p];
+  for(let i=idx;i<CELLS-1;i++)arr[i]=arr[i+1];
+  arr[CELLS-1]='';
+  if(p+1<pages.length){arr[CELLS-1]=pages[p+1][0]||'';cascadeDelete(p+1);}
+  while(pages.length>1&&pages[pages.length-1].every(c=>!c))pages.pop();
+  render();focusIME();
+}
 function cascadeDelete(pi){
   const arr=pages[pi];
   for(let i=0;i<CELLS-1;i++)arr[i]=arr[i+1];
@@ -328,110 +355,133 @@ document.addEventListener('mousedown',e=>{
 
 /* ════════════════════════════════════════════
    PDF生成 (ブラウザ完結)
-   1. 元PDFをpdf.jsでCanvasにレンダリング
-   2. 文字をCanvasに追記
-   3. jsPDFで画像としてPDF出力
+
+   座標系:
+     RES = 3  → canvas 1px = 1/3 pt
+     セル中心座標 = pt値 × RES
+     文字中心: textBaseline='alphabetic' + measureText で正確に配置
 ════════════════════════════════════════════ */
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+const SERIF = '"Noto Serif JP","Yu Mincho","游明朝","Hiragino Mincho ProN",serif';
+const RES   = 3;
+
+async function loadFont(fsPx){
+  try{
+    const ff=new FontFace('Noto Serif JP',
+      'url(https://fonts.gstatic.com/s/notoserifjp/v30/xn77YHs72GKoTvER4Gn3b5eMZBaPRkgfCMtqt7BBZW0.woff2)');
+    await ff.load();
+    document.fonts.add(ff);
+  }catch(e){}
+  await document.fonts.ready;
+  const tmp=document.createElement('canvas');
+  tmp.width=300; tmp.height=200;
+  const tc=tmp.getContext('2d');
+  tc.font=`${fsPx}px ${SERIF}`;
+  for(const c of '吾輩は猫であるabcABC。、') tc.fillText(c,10,100);
+}
+
+// セル中央に文字を描画 (textBaseline='top' + fontBoundingBox で確実な中央配置)
+function drawCentered(ctx, ch, cellCx, cellCy){
+  const m = ctx.measureText(ch);
+  const w = m.width;
+  const h = (m.fontBoundingBoxAscent + m.fontBoundingBoxDescent) || m.width; // 正方形フォールバック
+  ctx.fillText(ch, cellCx - w/2, cellCy - h/2);
+}
+
 async function downloadPDF(){
   const btn=document.getElementById('dl-btn');
   const loading=document.getElementById('loading');
-  btn.disabled=true;loading.classList.add('show');
+  btn.disabled=true; loading.classList.add('show');
   try{
     const {jsPDF}=window.jspdf;
-    const doc=new jsPDF({orientation:'landscape',unit:'pt',format:[PDF_W,PDF_H]});
 
-    // 元PDFをArrayBufferに変換
+    const fsPx = Math.round(Math.min(CR, CH) * 0.60 * RES);
+    await loadFont(fsPx);
+
     const raw=atob(ORIG_PDF_B64);
     const buf=new Uint8Array(raw.length);
-    for(let i=0;i<raw.length;i++)buf[i]=raw.charCodeAt(i);
-    const pdfDoc=await pdfjsLib.getDocument({data:buf}).promise;
-    const origPage=await pdfDoc.getPage(1);
+    for(let i=0;i<raw.length;i++) buf[i]=raw.charCodeAt(i);
+    const pdfDoc  = await pdfjsLib.getDocument({data:buf}).promise;
+    const origPg  = await pdfDoc.getPage(1);
+    const vp      = origPg.getViewport({scale:RES});
 
-    for(let pi=0;pi<pages.length;pi++){
-      if(pi>0)doc.addPage([PDF_W,PDF_H],'landscape');
-      const canvas=await renderPageToCanvas(origPage,pages[pi]);
-      const imgData=canvas.toDataURL('image/jpeg',0.95);
-      doc.addImage(imgData,'JPEG',0,0,PDF_W,PDF_H);
+    const canvasW = Math.round(PDF_W * RES);
+    const canvasH = Math.round(PDF_H * RES);
+
+    // format=[W,H] のみ指定（W>H なので自動で横向き）
+    // PDF_W=842 > PDF_H=595 なのでputOnlyUsedFontsを使い横向きを強制
+    const doc = new jsPDF({orientation:'l', unit:'pt', format:[PDF_W, PDF_H], compress:true});
+
+    for(let pi=0; pi<pages.length; pi++){
+      if(pi>0) doc.addPage([PDF_W, PDF_H], 'l');
+
+      const canvas = document.createElement('canvas');
+      canvas.width = canvasW; canvas.height = canvasH;
+      const ctx = canvas.getContext('2d');
+      await origPg.render({canvasContext:ctx, viewport:vp}).promise;
+
+      // ── 本文 ──
+      ctx.fillStyle    = '#111';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'top';
+      ctx.font         = `${fsPx}px ${SERIF}`;
+
+      const pd = pages[pi];
+      for(let i=0; i<pd.length; i++){
+        const ch = pd[i];
+        // 空文字・全角スペースは描画しない。
+        // ★ iからcol/rowを計算するためスキップしても座標はズレない
+        if(!ch || ch==='\u3000') continue;
+        const col = Math.floor(i / ROWS);
+        const row = i % ROWS;
+        const cellCx = colCx(col) * RES;
+        const cellCy = (OT + row*CH + CH/2) * RES;
+        drawCentered(ctx, ch, cellCx, cellCy);
+      }
+
+      // ── メタ欄 ──
+      const lfsPx  = Math.round(fsPx * 0.52);
+      const lineH  = lfsPx * 1.5;
+      ctx.font     = `${lfsPx}px ${SERIF}`;
+
+      const metaW  = (META_R - OR_) * RES;
+      const valCx  = OR_*RES + metaW*0.32;
+      const splitY = 316.8 * RES;  // 660px@150dpi = 316.8pt
+
+      const title  = v('inp-title');
+      const school = v('inp-school');
+      const uname  = v('inp-name');
+      const year   = v('inp-year');
+
+      for(let i=0; i<title.length && i<10; i++){
+        const cy = OT*RES + (i+0.8)*lineH;
+        if(cy > splitY - lineH) break;
+        drawCentered(ctx, title[i], valCx, cy);
+      }
+      const infoTop = splitY + lineH*0.4;
+      for(let i=0; i<school.length && i<6; i++)
+        drawCentered(ctx, school[i], valCx, infoTop + i*lineH);
+      const nameTop = infoTop + (OB-OT)*RES*0.26;
+      for(let i=0; i<uname.length && i<5; i++)
+        drawCentered(ctx, uname[i], valCx, nameTop + i*lineH);
+      const yearY  = OB*RES - lfsPx*2.5;
+      const yearCx = OR_*RES + metaW*0.5;
+      for(let i=0; i<year.length; i++)
+        drawCentered(ctx, year[i], yearCx, yearY + i*lineH);
+
+      const imgData = canvas.toDataURL('image/png');
+      doc.addImage(imgData, 'PNG', 0, 0, PDF_W, PDF_H);
     }
     doc.save('原稿用紙.pdf');
   }catch(e){
     alert('PDF生成エラー: '+e.message);
     console.error(e);
   }finally{
-    btn.disabled=false;loading.classList.remove('show');
+    btn.disabled=false; loading.classList.remove('show');
   }
 }
-
-async function renderPageToCanvas(origPage, pageData){
-  // 元PDFを高解像度でCanvasにレンダリング
-  const SCALE=2.0; // 2x解像度
-  const vp=origPage.getViewport({scale:SCALE});
-  const canvas=document.createElement('canvas');
-  canvas.width=vp.width;canvas.height=vp.height;
-  const ctx=canvas.getContext('2d');
-
-  await origPage.render({canvasContext:ctx,viewport:vp}).promise;
-
-  // フォント設定
-  await document.fonts.ready;
-  const fonts='"Noto Serif JP","Yu Mincho","游明朝",serif';
-
-  // セルサイズ(canvas px)
-  const cW_px=CW*SCALE, cH_px=CH*SCALE;
-  const fs_px=Math.round(Math.min(cW_px,cH_px)*0.62);
-
-  ctx.font=`${fs_px}px ${fonts}`;
-  ctx.fillStyle='#111111';
-  ctx.textAlign='center';
-  ctx.textBaseline='middle';
-
-  // 本文文字を描画（縦書き: col=0=右端）
-  for(let i=0;i<pageData.length;i++){
-    const ch=pageData[i];
-    if(!ch||ch==='\u3000')continue;
-    const col=Math.floor(i/ROWS),row=i%ROWS;
-    // canvas座標 (top-left基点)
-    const cx=(OL+(COLS-1-col)*CW+CW/2)*SCALE;
-    const cy=(OT+row*CH+CH/2)*SCALE;
-    ctx.fillText(ch,cx,cy);
-  }
-
-  // メタ欄テキスト
-  const meta_w_pt=META_R-OR_;
-  const lfs=Math.round(fs_px*0.52);
-  const lH=lfs*1.45;
-  const val_cx_px=(OR_+meta_w_pt*0.32)*SCALE;
-  const meta_split_px=660*px2pt*SCALE; // 上から（canvas座標）
-
-  ctx.font=`${lfs}px ${fonts}`;
-  ctx.textAlign='center';ctx.textBaseline='middle';
-
-  // 題名
-  for(let i=0;i<v('inp-title').length&&i<10;i++){
-    const cy=OT*SCALE+(i+0.8)*lH;
-    if(cy>meta_split_px-lH)break;
-    ctx.fillText(v('inp-title')[i],val_cx_px,cy);
-  }
-  // 学校名
-  const info_top=meta_split_px+lH*0.4;
-  for(let i=0;i<v('inp-school').length&&i<6;i++)
-    ctx.fillText(v('inp-school')[i],val_cx_px,info_top+i*lH);
-  // 氏名
-  const name_top=info_top+(OB-OT)*SCALE*0.26;
-  for(let i=0;i<v('inp-name').length&&i<5;i++)
-    ctx.fillText(v('inp-name')[i],val_cx_px,name_top+i*lH);
-  // 年度
-  const year_y=OB*SCALE-lfs*2.5;
-  const cx_year=(OR_+meta_w_pt*0.5)*SCALE;
-  for(let i=0;i<v('inp-year').length;i++)
-    ctx.fillText(v('inp-year')[i],cx_year,year_y+i*lH);
-
-  return canvas;
-}
-
 render();
 </script>
 </body>
